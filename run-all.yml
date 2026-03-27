@@ -1,0 +1,17 @@
+---
+# GitHub Repo Activity Analyzer - Full Pipeline
+# Collects data from GitHub API then generates analysis and charts.
+# STRICTLY READ-ONLY: Never modifies any target repository.
+#
+# Usage:
+#   ansible-playbook run-all.yml
+#
+# Or run stages independently:
+#   ansible-playbook collect.yml     # just refresh data
+#   ansible-playbook analyze.yml     # just re-generate charts
+
+- name: Collect data
+  ansible.builtin.import_playbook: collect.yml
+
+- name: Analyze data
+  ansible.builtin.import_playbook: analyze.yml

@@ -1,0 +1,27 @@
+# GitHub Repo Activity Analyzer - Repository Configuration
+# --------------------------------------------------------
+# This tool is STRICTLY READ-ONLY. It never modifies any target repository.
+
+# GitHub token is read from the GITHUB_TOKEN environment variable.
+# Set it before running:  export GITHUB_TOKEN="ghp_your_token_here"
+# Unauthenticated: 60 requests/hr | Authenticated: 5,000 requests/hr
+github_token: "{{ lookup('ansible.builtin.env', 'GITHUB_TOKEN', default='') }}"
+
+# Auto-discover repos from GitHub orgs or users matching a name pattern
+# Set type to "orgs" for organizations or "users" for personal accounts
+org_patterns:
+  # - org: "nmartins0611"
+  #   type: "users"              # "orgs" for organizations, "users" for personal accounts
+  #   match: "zt-ans"            # substring match on repo name
+
+# Manually specified repos (owner/repo format)
+manual_repos:
+  - "nmartins0611/eda-vault-plugin"
+  - "rhpds/zt-ans-bu-cloud-azure-operations-aap"
+
+# How far back to collect data (ISO 8601 date)
+history_since: "2024-01-01"
+
+# Commits closer together than this threshold (in minutes) are grouped
+# into a single "work session" for time-spent estimation
+session_gap_minutes: 120

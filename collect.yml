@@ -1,0 +1,275 @@
+---
+# GitHub Repo Activity Analyzer - Data Collection Playbook
+# STRICTLY READ-ONLY: Only GET requests are made to the GitHub API.
+- name: Collect GitHub repository activity data
+  hosts: localhost
+  connection: local
+  vars_files:
+    - repos.yml
+  vars:
+    base_url: "https://api.github.com"
+    data_dir: "{{ playbook_dir }}/data"
+    per_page: 100
+    auth_header: "{{ {'Authorization': 'Bearer ' + github_token} if github_token | default('') | length > 0 else {} }}"
+    common_headers: "{{ {'Accept': 'application/vnd.github.v3+json'} | combine(auth_header) }}"
+
+  tasks:
+    # ------------------------------------------------------------------
+    # Phase 1: Build the combined repo list
+    # ------------------------------------------------------------------
+    - name: Ensure data directory exists
+      ansible.builtin.file:
+        path: "{{ data_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Discover repos matching org patterns via search API
+      ansible.builtin.uri:
+        url: "{{ base_url }}/search/repositories?q={{ item.match }}+in:name+{{ 'org' if item.type | default('orgs') == 'orgs' else 'user' }}:{{ item.org }}&per_page={{ per_page }}"
+        method: GET
+        headers: "{{ common_headers }}"
+        return_content: true
+        status_code: [200]
+      register: org_repos_raw
+      loop: "{{ org_patterns | default([]) }}"
+      loop_control:
+        label: "{{ item.org }}/{{ item.match }}"
+      when: org_patterns | default([]) | length > 0
+
+    - name: Extract discovered repo names
+      ansible.builtin.set_fact:
+        discovered_repos: >-
+          {{
+            discovered_repos | default([]) +
+            (item.json['items'] | default([]) | map(attribute='full_name') | list)
+          }}
+      loop: "{{ org_repos_raw.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.org | default('skip') }}"
+      when:
+        - org_repos_raw is defined
+        - item.json is defined
+        - item.json['items'] is defined
+
+    - name: Combine discovered and manual repos
+      ansible.builtin.set_fact:
+        all_repos: "{{ ((discovered_repos | default([])) + (manual_repos | default([]))) | unique }}"
+
+    - name: Display repos to be analyzed
+      ansible.builtin.debug:
+        msg: "Repos to analyze ({{ all_repos | length }}): {{ all_repos | join(', ') }}"
+
+    - name: Fail if no repos configured
+      ansible.builtin.fail:
+        msg: >-
+          No repos found. Add repos to manual_repos in repos.yml or
+          configure org_patterns to auto-discover.
+      when: all_repos | length == 0
+
+    # ------------------------------------------------------------------
+    # Phase 2: Collect data for each repo (tolerates rate limits)
+    # ------------------------------------------------------------------
+    - name: Create per-repo data directories
+      ansible.builtin.file:
+        path: "{{ data_dir }}/{{ item | replace('/', '_') }}"
+        state: directory
+        mode: "0755"
+      loop: "{{ all_repos }}"
+
+    - name: Collect commit history
+      ansible.builtin.uri:
+        url: "{{ base_url }}/repos/{{ item }}/commits?per_page={{ per_page }}&since={{ history_since }}T00:00:00Z"
+        method: GET
+        headers: "{{ common_headers }}"
+        return_content: true
+        status_code: [200, 403, 409]
+      register: commits_page1
+      loop: "{{ all_repos }}"
+      loop_control:
+        label: "{{ item }} commits"
+        pause: 1
+
+    - name: Save first page of commits
+      ansible.builtin.copy:
+        content: "{{ item.json | to_nice_json }}"
+        dest: "{{ data_dir }}/{{ item.item | replace('/', '_') }}/commits_page1.json"
+        mode: "0644"
+      loop: "{{ commits_page1.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when:
+        - item.json is defined
+        - item.json is iterable
+        - item.json is not string
+        - item.status | default(0) == 200
+
+    - name: Check for additional commit pages
+      ansible.builtin.set_fact:
+        repos_with_more_commits: >-
+          {{
+            commits_page1.results
+            | selectattr('status', 'equalto', 200)
+            | selectattr('link', 'defined')
+            | selectattr('link', 'search', 'rel="next"')
+            | map(attribute='item')
+            | list
+          }}
+
+    - name: Fetch commit pages 2-5 for repos with more data
+      ansible.builtin.uri:
+        url: "{{ base_url }}/repos/{{ item.0 }}/commits?per_page={{ per_page }}&since={{ history_since }}T00:00:00Z&page={{ item.1 }}"
+        method: GET
+        headers: "{{ common_headers }}"
+        return_content: true
+        status_code: [200, 403]
+      register: commits_extra
+      loop: "{{ repos_with_more_commits | default([]) | product([2, 3, 4, 5]) | list }}"
+      loop_control:
+        label: "{{ item.0 }} page {{ item.1 }}"
+        pause: 1
+      when: repos_with_more_commits | default([]) | length > 0
+      ignore_errors: true
+
+    - name: Save extra commit pages
+      ansible.builtin.copy:
+        content: "{{ item.json | to_nice_json }}"
+        dest: "{{ data_dir }}/{{ item.item.0 | replace('/', '_') }}/commits_page{{ item.item.1 }}.json"
+        mode: "0644"
+      loop: "{{ commits_extra.results | default([]) }}"
+      loop_control:
+        label: "{{ item.item.0 | default('skip') }} page {{ item.item.1 | default('?') }}"
+      when:
+        - item.json is defined
+        - item.json is iterable
+        - item.json is not string
+        - item.status | default(0) == 200
+        - item.json | length > 0
+
+    - name: Collect pull requests
+      ansible.builtin.uri:
+        url: "{{ base_url }}/repos/{{ item }}/pulls?per_page={{ per_page }}&state=all&sort=created&direction=desc"
+        method: GET
+        headers: "{{ common_headers }}"
+        return_content: true
+        status_code: [200, 403]
+      register: pulls_raw
+      loop: "{{ all_repos }}"
+      loop_control:
+        label: "{{ item }} PRs"
+        pause: 1
+
+    - name: Save pull request data
+      ansible.builtin.copy:
+        content: "{{ item.json | to_nice_json }}"
+        dest: "{{ data_dir }}/{{ item.item | replace('/', '_') }}/pulls.json"
+        mode: "0644"
+      loop: "{{ pulls_raw.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when:
+        - item.json is defined
+        - item.json is iterable
+        - item.json is not string
+        - item.status | default(0) == 200
+
+    - name: Collect issues
+      ansible.builtin.uri:
+        url: "{{ base_url }}/repos/{{ item }}/issues?per_page={{ per_page }}&state=all&sort=created&direction=desc"
+        method: GET
+        headers: "{{ common_headers }}"
+        return_content: true
+        status_code: [200, 403]
+      register: issues_raw
+      loop: "{{ all_repos }}"
+      loop_control:
+        label: "{{ item }} issues"
+        pause: 1
+
+    - name: Save issue data
+      ansible.builtin.copy:
+        content: "{{ item.json | to_nice_json }}"
+        dest: "{{ data_dir }}/{{ item.item | replace('/', '_') }}/issues.json"
+        mode: "0644"
+      loop: "{{ issues_raw.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when:
+        - item.json is defined
+        - item.json is iterable
+        - item.json is not string
+        - item.status | default(0) == 200
+
+    - name: Collect code frequency stats
+      ansible.builtin.uri:
+        url: "{{ base_url }}/repos/{{ item }}/stats/code_frequency"
+        method: GET
+        headers: "{{ common_headers }}"
+        return_content: true
+        status_code: [200, 202, 204, 403]
+      register: code_freq_raw
+      loop: "{{ all_repos }}"
+      loop_control:
+        label: "{{ item }} code_frequency"
+        pause: 1
+
+    - name: Save code frequency data
+      ansible.builtin.copy:
+        content: "{{ item.json | default([]) | to_nice_json }}"
+        dest: "{{ data_dir }}/{{ item.item | replace('/', '_') }}/code_frequency.json"
+        mode: "0644"
+      loop: "{{ code_freq_raw.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when:
+        - item.json is defined
+        - item.status | default(0) in [200, 202]
+
+    # ------------------------------------------------------------------
+    # Phase 3: Save metadata and report rate limit status
+    # ------------------------------------------------------------------
+    - name: Check remaining rate limit
+      ansible.builtin.uri:
+        url: "{{ base_url }}/rate_limit"
+        method: GET
+        headers: "{{ common_headers }}"
+        return_content: true
+        status_code: [200, 403]
+      register: rate_limit_check
+      ignore_errors: true
+
+    - name: Report rate limit status
+      ansible.builtin.debug:
+        msg: >-
+          GitHub API rate limit: {{ rate_limit_check.json.rate.remaining | default('unknown') }}
+          / {{ rate_limit_check.json.rate.limit | default('unknown') }} remaining.
+          {% if rate_limit_check.json.rate.remaining | default(1) | int == 0 %}
+          Rate limit exhausted! Set github_token in repos.yml for 5000 req/hr.
+          Resets at {{ rate_limit_check.json.rate.reset | default('unknown') }}.
+          {% endif %}
+      when: rate_limit_check.json is defined
+      ignore_errors: true
+
+    - name: Get current timestamp
+      ansible.builtin.command:
+        cmd: date -u +%Y-%m-%dT%H:%M:%SZ
+      register: timestamp_result
+      changed_when: false
+
+    - name: Record collection metadata
+      ansible.builtin.copy:
+        content: |
+          {
+            "collected_at": "{{ timestamp_result.stdout }}",
+            "repos": {{ all_repos | to_nice_json }},
+            "history_since": "{{ history_since }}",
+            "session_gap_minutes": {{ session_gap_minutes }}
+          }
+        dest: "{{ data_dir }}/collection_metadata.json"
+        mode: "0644"
+
+    - name: Collection complete
+      ansible.builtin.debug:
+        msg: >-
+          Data collection complete for {{ all_repos | length }} repo(s).
+          Raw data saved to {{ data_dir }}/
+          Run 'ansible-playbook analyze.yml' to generate charts.

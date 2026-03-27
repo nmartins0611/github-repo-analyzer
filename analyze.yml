@@ -1,0 +1,65 @@
+---
+# GitHub Repo Activity Analyzer - Analysis Playbook
+# Generates charts and summary from previously collected data.
+- name: Analyze GitHub repository activity data
+  hosts: localhost
+  connection: local
+  vars_files:
+    - repos.yml
+  vars:
+    data_dir: "{{ playbook_dir }}/data"
+    reports_dir: "{{ playbook_dir }}/reports"
+    scripts_dir: "{{ playbook_dir }}/scripts"
+
+  tasks:
+    - name: Check that data directory exists and has content
+      ansible.builtin.find:
+        paths: "{{ data_dir }}"
+        file_type: directory
+      register: data_dirs
+
+    - name: Fail if no data collected yet
+      ansible.builtin.fail:
+        msg: >-
+          No data found in {{ data_dir }}/.
+          Run 'ansible-playbook collect.yml' first to gather repo data.
+      when: data_dirs.matched == 0
+
+    - name: Ensure reports directory exists
+      ansible.builtin.file:
+        path: "{{ reports_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Ensure Python dependencies are installed
+      ansible.builtin.pip:
+        requirements: "{{ playbook_dir }}/requirements.txt"
+        state: present
+      ignore_errors: true
+
+    - name: Run analysis script
+      ansible.builtin.command:
+        cmd: >-
+          python3 {{ scripts_dir }}/analyze.py
+          --data-dir {{ data_dir }}
+          --reports-dir {{ reports_dir }}
+          --session-gap {{ session_gap_minutes | default(120) }}
+        chdir: "{{ playbook_dir }}"
+      register: analysis_output
+      changed_when: true
+
+    - name: Display analysis output
+      ansible.builtin.debug:
+        msg: "{{ analysis_output.stdout_lines }}"
+
+    - name: List generated reports
+      ansible.builtin.find:
+        paths: "{{ reports_dir }}"
+        patterns: "*.png,*.txt"
+      register: report_files
+
+    - name: Report summary
+      ansible.builtin.debug:
+        msg: >-
+          Analysis complete! Generated {{ report_files.matched }} files in {{ reports_dir }}/:
+          {{ report_files.files | map(attribute='path') | map('basename') | sort | join(', ') }}
